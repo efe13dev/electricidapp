@@ -24,6 +24,11 @@ export function Explain({
   removeSelected,
   setWires,
   total,
+  isOff,
+  inLive,
+  outLive,
+  onToggle,
+  onTest,
 }) {
   const cat = CATALOG.find((k) => k.type === comp.type);
   const sec = sectionOf(comp, project.components);
@@ -68,6 +73,27 @@ export function Explain({
         {cat?.name} ({displayName(comp, ordinals)})
         {comp.label ? ` — ${comp.label}` : ""}
       </h2>
+      {comp.type !== "spd" && (
+        <div className="switch-bar">
+          <span className={`switch-state${outLive ? " on" : ""}`}>
+            {isOff
+              ? "Palanca bajada (O · OFF)"
+              : outLive
+                ? "Subido · Con corriente (I · ON)"
+                : inLive
+                  ? "Subido (I · ON)"
+                  : "Subido · Sin corriente de entrada"}
+          </span>
+          <button type="button" className="primary" onClick={onToggle}>
+            {isOff ? "Subir palanca (ON)" : "Bajar palanca (OFF)"}
+          </button>
+          {comp.type === "id" && (
+            <button type="button" onClick={onTest}>
+              Probar botón T
+            </button>
+          )}
+        </div>
+      )}
       <p>
         <strong>¿Qué es?</strong> {cat?.explain.what}
       </p>

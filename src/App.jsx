@@ -8,6 +8,7 @@ import {
   chainOf,
   circuitByKey,
   denoise,
+  energized,
   faultyPins,
   issues,
   MAX_PTS,
@@ -108,8 +109,8 @@ function newProject() {
   return {
     version: 5,
     name: DEFAULT_NAME,
-    rows: 1,
-    perRow: 18,
+    rows: 2,
+    perRow: 12,
     components: [],
     wires: [],
   };
@@ -143,10 +144,22 @@ function wireD(w, A, B) {
 function loadProject() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { project: typicalProject(), warning: null };
+    if (!raw) return { project: newProject(), warning: null };
     const obj = JSON.parse(raw);
     const parsed = validateProject(obj);
-    if (parsed) return { project: parsed, warning: null };
+    if (parsed) {
+      if (
+        parsed.rows === 1 &&
+        parsed.perRow === 18 &&
+        packComponents(parsed.components, 2, 12)
+      ) {
+        return {
+          project: { ...parsed, rows: 2, perRow: 12 },
+          warning: null,
+        };
+      }
+      return { project: parsed, warning: null };
+    }
     return {
       project: newProject(),
       warning:
@@ -177,7 +190,9 @@ export default function App() {
   const [guideStep, setGuideStep] = useState(null);
   const [paths, setPaths] = useState({});
   const [drawing, setDrawing] = useState(false);
+  const [pendingPin, setPendingPin] = useState(null);
   const [trace, setTrace] = useState(null);
+  const [offIds, setOffIds] = useState(() => new Set());
   const innerRef = useRef(null);
   const stroke = useRef(null);
 
@@ -224,6 +239,30 @@ export default function App() {
   );
   const warnings = useMemo(() => issues(project), [project]);
   const faulty = useMemo(() => faultyPins(project.wires), [project.wires]);
+  const power = useMemo(
+    () => energized(project.components, project.wires, offIds),
+    [project.components, project.wires, offIds],
+  );
+
+  function toggleSwitch(id) {
+    setOffIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function testRcd(id) {
+    if (power.inLive.has(id) && !offIds.has(id)) {
+      setOffIds((prev) => new Set(prev).add(id));
+      setNotice(null);
+    } else {
+      setNotice(
+        "El botón Test (T) solo hace saltar el diferencial cuando está subido y le llega corriente.",
+      );
+    }
+  }
 
   const pathSet = useMemo(() => {
     if (!selected) return null;
@@ -408,7 +447,7 @@ export default function App() {
 
   const pinAt = ([x, y]) => {
     let best = null;
-    let bestD = 14;
+    let bestD = 16;
     for (const [pin, q] of Object.entries(paths.pos ?? {})) {
       const d = Math.hypot(q.x - x, q.y - y);
       if (!pin.includes("-card") && d <= bestD) {
@@ -419,13 +458,82 @@ export default function App() {
     return best;
   };
 
+  const pinLabel = (pin) => {
+    if (pin === "supply-L") return "Contador · Fase (L)";
+    if (pin === "supply-N") return "Contador · Neutro (N)";
+    if (pin === "earth-PE") return "Barra de tierra (PE)";
+    const owner = byId.get(pinOwner(pin));
+    const side = pin.includes("-in")
+      ? `Entrada ${pinPole(pin)}`
+      : pin.endsWith("-pe")
+        ? "Tierra (PE)"
+        : `Salida ${pinPole(pin)}`;
+    return `${owner ? displayName(owner, ordinals) : "Aparato"} · ${side}`;
+  };
+
+  function toggleDrawing(next = !drawing) {
+    stroke.current = null;
+    setPendingPin(null);
+    setTrace(null);
+    setDrawing(next);
+  }
+
+  function connectPins(a, b, pts = []) {
+    const next = {
+      ...project,
+      wires: [
+        ...project.wires,
+        {
+          id: crypto.randomUUID(),
+          a,
+          b,
+          pts,
+        },
+      ],
+    };
+    const before = new Set(warnings.map((i) => i.text));
+    const added = issues(next).filter(
+      (i) => !before.has(i.text) && i.level !== "info",
+    );
+    if (added.length) {
+      setAlert({
+        level: added.some((i) => i.level === "danger") ? "danger" : "warn",
+        items: added.map((i) => i.text),
+      });
+    } else if (faultyPins(next.wires).has(a)) {
+      setAlert({
+        level: "danger",
+        items: ["Este cable crea un fallo en la instalación."],
+      });
+    } else {
+      setAlert(null);
+    }
+    setNotice(null);
+    setPendingPin(null);
+    setTrace(null);
+    apply(next);
+  }
+
   function boardDown(e) {
+    if (e.target.closest(".lever-slot, .flag, .test-btn")) return;
     const p = boardPoint(e);
     const a = pinAt(p);
     if (a) {
+      if (!drawing) setDrawing(true);
+      if (pendingPin) {
+        if (a !== pendingPin) connectPins(pendingPin, a, []);
+        else {
+          setPendingPin(null);
+          setTrace(null);
+        }
+        return;
+      }
       e.currentTarget.setPointerCapture(e.pointerId);
-      stroke.current = { a, pts: [p] };
+      stroke.current = { a, pts: [p], p0: p };
       setTrace(stroke.current);
+    } else if (pendingPin) {
+      setPendingPin(null);
+      setTrace(null);
     } else if (!drawing) {
       if (!e.target.closest(".device, .circuit-card")) setSelectedId(null);
     } else {
@@ -442,63 +550,46 @@ export default function App() {
 
   function boardMove(e) {
     const s = stroke.current;
-    if (!s) return;
-    const p = boardPoint(e);
-    const last = s.pts.at(-1);
-    if (
-      s.pts.length < MAX_PTS &&
-      Math.hypot(p[0] - last[0], p[1] - last[1]) >= 3
-    ) {
-      s.pts.push(p);
-      setTrace({ ...s });
+    if (s) {
+      const p = boardPoint(e);
+      const last = s.pts.at(-1);
+      if (
+        s.pts.length < MAX_PTS &&
+        Math.hypot(p[0] - last[0], p[1] - last[1]) >= 3
+      ) {
+        s.pts.push(p);
+        setTrace({ ...s });
+      }
+      return;
+    }
+    if (pendingPin && paths.pos?.[pendingPin]) {
+      const A = paths.pos[pendingPin];
+      setTrace({ a: pendingPin, pts: [[A.x, A.y], boardPoint(e)] });
     }
   }
 
   function boardCancel() {
     stroke.current = null;
-    setTrace(null);
+    if (!pendingPin) setTrace(null);
   }
 
   function boardUp(e) {
     const s = stroke.current;
-    boardCancel();
+    stroke.current = null;
     if (!s) return;
-    const b = pinAt(boardPoint(e));
+    const p = boardPoint(e);
+    const b = pinAt(p);
     if (b && b !== s.a) {
-      const next = {
-        ...project,
-        wires: [
-          ...project.wires,
-          {
-            id: crypto.randomUUID(),
-            a: s.a,
-            b,
-            pts: simplify(denoise(s.pts), 3),
-          },
-        ],
-      };
-      const before = new Set(warnings.map((i) => i.text));
-      const added = issues(next).filter(
-        (i) => !before.has(i.text) && i.level !== "info",
-      );
-      if (added.length) {
-        setAlert({
-          level: added.some((i) => i.level === "danger") ? "danger" : "warn",
-          items: added.map((i) => i.text),
-        });
-      } else if (faultyPins(next.wires).has(s.a)) {
-        setAlert({
-          level: "danger",
-          items: ["Este cable crea un fallo en la instalación."],
-        });
-      } else {
-        setAlert(null);
-      }
+      connectPins(s.a, b, simplify(denoise(s.pts), 3));
+    } else if (Math.hypot(p[0] - s.p0[0], p[1] - s.p0[1]) < 8) {
+      const A = paths.pos?.[s.a];
+      setPendingPin(s.a);
+      setTrace(A ? { a: s.a, pts: [[A.x, A.y], p] } : null);
       setNotice(null);
-      apply(next);
-    } else if (s.pts.length > 1) {
+    } else {
+      setTrace(null);
       setNotice(
-        "Suelta el cable encima de un borne (los círculos de colores) para conectarlo.",
+        "Suelta el cable encima de un borne o haz clic en un borne y luego en otro para unirlos.",
       );
     }
   }
@@ -523,6 +614,20 @@ export default function App() {
     setSelectedId(null);
     setAlert(null);
     apply(typicalProject());
+  }
+
+  function clearBoard() {
+    if (
+      project.components.length > 0 &&
+      !window.confirm("Se vaciará el cuadro actual. ¿Continuar?")
+    ) {
+      return;
+    }
+    setGuideStep(null);
+    setSelectedId(null);
+    setAlert(null);
+    setNotice(null);
+    apply(newProject());
   }
 
   function startGuide() {
@@ -599,6 +704,9 @@ export default function App() {
           </button>
           <button type="button" onClick={loadTypical}>
             Cuadro típico
+          </button>
+          <button type="button" onClick={clearBoard}>
+            Vaciar cuadro
           </button>
           <button
             type="button"
@@ -773,26 +881,88 @@ export default function App() {
               </label>
               <button
                 type="button"
+                className={`wire-mode-btn${drawing ? " active" : ""}`}
                 aria-pressed={drawing}
-                onClick={() => setDrawing(!drawing)}
+                onClick={() => toggleDrawing()}
               >
-                Editar cables
+                <span className="mode-dot" aria-hidden="true" />
+                {drawing ? "Editor de cables: ACTIVO" : "Editar cables"}
+                <span className="mode-pill">
+                  {drawing ? "Salir" : "Inactivo"}
+                </span>
               </button>
               <span className="count" aria-live="polite">
                 Ocupados {occupied} · Libres {total - occupied} (ajuste físico)
               </span>
             </div>
-            {drawing ? (
-              <p className="hint">
-                Arrastra desde un borne hasta otro para tender un cable. Toca un
-                cable para borrarlo.
-              </p>
-            ) : (
-              <p className="hint">
-                Arrastra desde un borne (círculo de color) hasta otro para
-                tender un cable. Activa «Editar cables» para borrar cables.
-              </p>
-            )}
+            <div
+              className={`wiring-banner${drawing ? " active" : ""}`}
+              role="status"
+            >
+              <div className="wiring-banner-text">
+                <span className="wiring-badge">
+                  {drawing ? "MODO CABLEADO ACTIVO" : "MODO NORMAL"}
+                </span>
+                {!drawing ? (
+                  <span>
+                    Acciona las palancas de los interruptores o toca cualquier
+                    borne para empezar a cablear.
+                  </span>
+                ) : pendingPin ? (
+                  <span>
+                    Origen: <strong>{pinLabel(pendingPin)}</strong> → haz clic
+                    en otro borne para conectar el cable.
+                  </span>
+                ) : (
+                  <span>
+                    Haz <strong>clic en dos bornes</strong> (o arrastra) para
+                    unirlos · Toca un cable para borrarlo.
+                  </span>
+                )}
+              </div>
+              <div className="wiring-banner-actions">
+                {drawing ? (
+                  <>
+                    {pendingPin && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPendingPin(null);
+                          setTrace(null);
+                        }}
+                      >
+                        Cancelar origen
+                      </button>
+                    )}
+                    {project.wires.length > 0 && (
+                      <button
+                        type="button"
+                        className="danger-btn"
+                        onClick={() => {
+                          setPendingPin(null);
+                          setTrace(null);
+                          setAlert(null);
+                          apply({ ...project, wires: [] });
+                        }}
+                      >
+                        Quitar todos ({project.wires.length})
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => toggleDrawing(false)}
+                    >
+                      Terminar de cablear
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => toggleDrawing(true)}>
+                    Editar cables
+                  </button>
+                )}
+              </div>
+            </div>
             {step && (
               <div className="guide-banner" role="status">
                 <div>
@@ -837,7 +1007,9 @@ export default function App() {
                 «Cuadro típico» para ver una vivienda normal.
               </p>
             )}
-            <div className={`enclosure${alert ? ` alert-${alert.level}` : ""}`}>
+            <div
+              className={`enclosure${drawing ? " wiring-active" : ""}${alert ? ` alert-${alert.level}` : ""}`}
+            >
               <div
                 className={`board-inner${drawing ? " drawing" : ""}`}
                 ref={innerRef}
@@ -861,7 +1033,11 @@ export default function App() {
                 >
                   {(paths.edges ?? []).map((e) => {
                     const lit = pathSet && e.touch.every((t) => pathSet.has(t));
-                    const cls = `wire ${e.kind}${lit ? " lit flow" : pathSet ? " dim" : ""}`;
+                    const live =
+                      e.kind !== "PE" &&
+                      e.touch.every((t) => power.outLive.has(t));
+                    const dead = e.kind !== "PE" && !live;
+                    const cls = `wire ${e.kind}${lit ? " lit" : pathSet ? " dim" : ""}${live ? " flow" : ""}${dead ? " dead" : ""}`;
                     return (
                       <g key={e.d}>
                         <path d={e.d} className="wire-bg" />
@@ -884,7 +1060,10 @@ export default function App() {
                     const lit =
                       pathSet?.has(pinOwner(w.a)) && pathSet.has(pinOwner(w.b));
                     const bad = faulty.has(w.a);
-                    const cls = `wire ${pole}${lit ? " lit flow" : pathSet ? " dim" : ""}${bad ? " bad" : ""}`;
+                    const live =
+                      pole !== "PE" && !bad && power.livePins.has(w.a);
+                    const dead = pole !== "PE" && !bad && !live;
+                    const cls = `wire ${pole}${lit ? " lit" : pathSet ? " dim" : ""}${live ? " flow" : ""}${dead ? " dead" : ""}${bad ? " bad" : ""}`;
                     return (
                       <g key={w.id}>
                         <path d={d} className="wire-bg" />
@@ -902,7 +1081,15 @@ export default function App() {
                   {trace && (
                     <path
                       d={smoothPath(trace.pts)}
-                      className={`wire ${pinPole(trace.a)}`}
+                      className={`wire ${pinPole(trace.a)} trace-preview`}
+                    />
+                  )}
+                  {pendingPin && paths.pos?.[pendingPin] && (
+                    <circle
+                      cx={paths.pos[pendingPin].x}
+                      cy={paths.pos[pendingPin].y}
+                      r="11"
+                      className={`pin-origin ${pinPole(pendingPin)}`}
                     />
                   )}
                 </svg>
@@ -914,6 +1101,12 @@ export default function App() {
                   );
                   return (
                     <div className="row-block" key={row[0]?.id ?? `fila-${ri}`}>
+                      <div className="row-head" aria-hidden="true">
+                        <span>CARRIL DIN {ri + 1}</span>
+                        <span>
+                          {used}/{project.perRow} módulos ocupados
+                        </span>
+                      </div>
                       <div
                         className="din-row"
                         style={{ "--per": project.perRow }}
@@ -926,13 +1119,32 @@ export default function App() {
                             ordinals={ordinals}
                             selected={c.id === selectedId}
                             dim={pathSet !== null && !pathSet.has(c.id)}
+                            isOff={offIds.has(c.id)}
+                            powered={
+                              c.type === "spd"
+                                ? power.inLive.has(c.id)
+                                : power.outLive.has(c.id)
+                            }
                             onClick={() => setSelectedId(c.id)}
+                            onToggle={
+                              c.type === "spd"
+                                ? undefined
+                                : () => toggleSwitch(c.id)
+                            }
+                            onTest={
+                              c.type === "id" ? () => testRcd(c.id) : undefined
+                            }
                             components={project.components}
                           />
                         ))}
                         {free.map((p) => (
-                          <span className="slot" key={p}>
-                            {p}
+                          <span
+                            className="slot"
+                            key={p}
+                            title={`Espacio libre ${p} (fila ${ri + 1})`}
+                          >
+                            <em className="slot-num">{p}</em>
+                            <i className="slot-din" aria-hidden="true" />
                           </span>
                         ))}
                       </div>
@@ -949,6 +1161,7 @@ export default function App() {
                               section={sectionOf(c, project.components)}
                               selected={c.id === selectedId}
                               dim={pathSet !== null && !pathSet.has(c.id)}
+                              powered={power.outLive.has(c.id)}
                               onClick={() => setSelectedId(c.id)}
                             />
                           ) : (
@@ -1011,6 +1224,11 @@ export default function App() {
                     apply({ ...project, wires });
                   }}
                   total={project.components.length}
+                  isOff={offIds.has(selected.id)}
+                  inLive={power.inLive.has(selected.id)}
+                  outLive={power.outLive.has(selected.id)}
+                  onToggle={() => toggleSwitch(selected.id)}
+                  onTest={() => testRcd(selected.id)}
                 />
               ) : (
                 <p className="hint">

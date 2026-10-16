@@ -243,6 +243,31 @@ export function chainOf(id, topo) {
   return chain;
 }
 
+// Qué aparatos y bornes tienen tensión según los interruptores bajados (offIds).
+export function energized(components, wires = [], offIds = new Set()) {
+  const topo = topology(components, wires);
+  const inLive = new Set();
+  const outLive = new Set();
+  for (const c of components) {
+    const chain = chainOf(c.id, topo);
+    if (chain.at(-1) === SUPPLY && !chain.some((p) => offIds.has(p))) {
+      inLive.add(c.id);
+      if (c.type !== "spd" && !offIds.has(c.id)) outLive.add(c.id);
+    }
+  }
+  const liveSources = new Set(["supply-L", "supply-N"]);
+  for (const id of outLive) {
+    liveSources.add(`${id}-outL`).add(`${id}-outN`);
+  }
+  const livePins = new Set(liveSources);
+  for (const g of new Set(nets(wires).values())) {
+    if ([...g].some((p) => liveSources.has(p))) {
+      for (const p of g) livePins.add(p);
+    }
+  }
+  return { inLive, outLive, livePins };
+}
+
 export function sectionOf(c, components) {
   if (c.type === "pia") return sectionFor(c.currentA);
   if (c.type === "iga" || c.type === "id") {
@@ -294,8 +319,8 @@ export function typicalProject() {
   return {
     version: 5,
     name: "Vivienda tipo (electrificación básica)",
-    rows: 1,
-    perRow: 18,
+    rows: 2,
+    perRow: 12,
     components: comps,
     wires,
   };

@@ -3,6 +3,7 @@ import {
   analyze,
   chainOf,
   denoise,
+  energized,
   faultyPins,
   issues,
   MAX_PTS,
@@ -306,6 +307,38 @@ describe("chainOf", () => {
   });
 });
 
+describe("energized", () => {
+  const g = comp2("g", "iga");
+  const d = comp2("d", "id");
+  const p1 = comp2("p1", "pia");
+  const p2 = comp2("p2", "pia");
+  const comps = [g, d, p1, p2];
+  const wires = [
+    wire("supply-L", "g-inL"),
+    wire("supply-N", "g-inN"),
+    wire("g-outL", "d-inL"),
+    wire("g-outN", "d-inN"),
+    wire("d-outL", "p1-inL"),
+    wire("d-outN", "p1-inN"),
+    wire("p1-inL", "p2-inL"),
+    wire("p1-inN", "p2-inN"),
+  ];
+
+  test("todo subido: todos con tensión; bajar IGA corta aguas abajo; bajar PIA 1 no corta PIA 2", () => {
+    const allOn = energized(comps, wires);
+    expect([...allOn.outLive]).toEqual(["g", "d", "p1", "p2"]);
+
+    const igaOff = energized(comps, wires, new Set(["g"]));
+    expect([...igaOff.inLive]).toEqual(["g"]);
+    expect([...igaOff.outLive]).toEqual([]);
+    expect(igaOff.livePins.has("g-inL")).toBe(true);
+    expect(igaOff.livePins.has("d-inL")).toBe(false);
+
+    const p1Off = energized(comps, wires, new Set(["p1"]));
+    expect([...p1Off.outLive]).toEqual(["g", "d", "p2"]);
+  });
+});
+
 describe("sectionOf", () => {
   test("pia by its own calibre; id/iga by the IGA", () => {
     const comps = [
@@ -325,6 +358,7 @@ describe("sectionOf", () => {
 describe("typicalProject", () => {
   test("validates, packs and analyzes clean", () => {
     const p = typicalProject();
+    expect([p.rows, p.perRow]).toEqual([2, 12]);
     expect(validateProject(JSON.parse(JSON.stringify(p)))).toEqual(p);
     expect(packComponents(p.components, p.rows, p.perRow)).not.toBeNull();
     expect(p.components.map((c) => c.type)).toEqual([
